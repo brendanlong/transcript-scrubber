@@ -19,18 +19,25 @@ Logs: `journalctl --user -u transcript-scrubber`.
   `[REDACTED:<rule-id>]`; it never applies a regex to the file itself.
 - Rules that fire on ordinary transcript content (generic high-entropy
   strings, git SHAs) are disabled in `gitleaks.toml`.
-- A file is only rewritten if no secret remains, the line count is unchanged
-  (apart from newlines inside a multi-line secret such as a PEM key), and every
-  JSON line that parsed before still parses. Otherwise it's left alone and
-  logged as `failed`, and the run exits non-zero.
+- A match is skipped (and logged as `not redacted`) if it looks like it covers
+  more than a secret: shorter than 16 characters, contains a `"` (spans JSON
+  strings), contains whitespace or line breaks, or is a PEM block whose body
+  isn't pure base64. Gitleaks' private-key rule matches lazily up to the next
+  `KEY-----`, which can be in a later message.
+- Each redaction must keep the line count (except newlines inside a PEM block
+  in a text file) and the exact JSON structure (same keys, same list lengths)
+  of every line. One bad match doesn't block the other secrets in a file.
 - Files modified in the last 30 minutes are skipped so live sessions aren't
-  touched, and the write is an atomic rename that aborts if the file changed.
+  touched. The rewrite is an atomic rename that keeps the file's mtime, aborts
+  if the file changed, and copies over anything appended during the swap.
 - The original of every rewritten file is kept (mode 0600) under
   `~/.local/state/transcript-scrubber/backups/<timestamp>/` for 7 days.
+- If gitleaks reports any error (e.g. a file it couldn't read), the run aborts
+  before recording anything.
 
 `state.sqlite` in the same directory records each file's size and mtime, so
-only new or changed files are rescanned. Changing the gitleaks version or
-`gitleaks.toml` rescans everything.
+only new or changed files are rescanned. Changing the gitleaks version,
+`gitleaks.toml` or `scrub.py` rescans everything.
 
 Run `./scrub.py` without `--apply` to see what would change.
 
