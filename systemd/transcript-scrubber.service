@@ -1,0 +1,9 @@
+[Unit]
+Description=Redact secrets from Claude Code transcripts
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/opt/transcript-scrubber/scrub.py --apply
+Nice=19
+IOSchedulingClass=idle
+CPUWeight=idle

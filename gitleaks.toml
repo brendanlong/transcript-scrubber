@@ -1,0 +1,7 @@
+# Disabled rules fire on ordinary transcript content:
+# generic-api-key matches hashes, base64 and random identifiers;
+# sourcegraph-access-token matches git commit SHAs;
+# vault-service-token matches Go code like `s.L0Retention`.
+[extend]
+useDefault = true
+disabledRules = ["generic-api-key", "sourcegraph-access-token", "vault-service-token"]
