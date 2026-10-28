@@ -126,6 +126,8 @@ def run_gitleaks(candidates: list[Candidate], work_dir: Path) -> dict[Path, dict
                 "--exit-code", "0",
                 "--no-banner",
                 "--log-level", "error",
+                # Transcript text must not be able to exempt itself.
+                "--ignore-gitleaks-allow",
             ],
             capture_output=True, text=True,
         )
@@ -157,6 +159,22 @@ def redact_text(text: str, secrets: dict[str, str]) -> tuple[str, Counter]:
 
 PEM = re.compile(r"-----BEGIN[ A-Z0-9_-]*-----(.*)-----END[ A-Z0-9_-]*-----", re.S)
 LINE_BREAKS = re.compile(r"\\[nrt]|\s")
+# Raw newlines, or JSON-escaped ones (possibly escaped more than once).
+PEM_LINE_SPLIT = re.compile(r"(?:\\)*\\[nr]|[\r\n]")
+# Line numbers from `cat -n`, grep -n or Claude Code's Read tool.
+LINE_NUMBER = re.compile(r"\s*\d+(?:\\t|\t|→|:|-)")
+BASE64 = re.compile(r"[A-Za-z0-9+/=]+")
+
+
+def is_pem_body(body: str) -> bool:
+    """True if every line is unbroken base64, as in a real key. Prose has spaces."""
+    lines = []
+    for line in PEM_LINE_SPLIT.split(body):
+        if m := LINE_NUMBER.match(line):
+            line = line[m.end():]
+        if line := line.strip():
+            lines.append(line)
+    return sum(map(len, lines)) >= 64 and all(BASE64.fullmatch(l) for l in lines)
 
 
 def implausible_secret(secret: str) -> str | None:
@@ -170,8 +188,8 @@ def implausible_secret(secret: str) -> str | None:
         # The private-key rule matches lazily up to the next "KEY-----", which
         # can be in a later message.
         m = PEM.fullmatch(secret)
-        if not m or not re.fullmatch(r"[A-Za-z0-9+/=]*", LINE_BREAKS.sub("", m[1])):
-            return "PEM body isn't just base64"
+        if not m or not is_pem_body(m[1]):
+            return "PEM body isn't lines of base64"
     elif LINE_BREAKS.search(secret):
         return "contains whitespace or line breaks"
     return None
@@ -222,11 +240,31 @@ def backup_path(backup_dir: Path, path: Path) -> Path:
 
 def write_private(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as f:
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
+
+
+def open_by_any_process(path: Path) -> bool:
+    """A writer holding the file open would keep writing to the old inode
+    after the rename, losing everything it writes from then on."""
+    target = str(path.resolve())
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            fds = os.listdir(f"/proc/{pid}/fd")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(f"/proc/{pid}/fd/{fd}") == target and int(pid) != os.getpid():
+                    return True
+            except OSError:
+                continue
+    return False
 
 
 def replace_file(c: Candidate, content: str) -> Result:
@@ -246,7 +284,12 @@ def replace_file(c: Candidate, content: str) -> Result:
             os.utime(tmp_name, ns=(c.mtime_ns, c.mtime_ns))
             new_st = os.stat(tmp_name)
             st = os.fstat(old.fileno())
-            if (st.st_size, st.st_mtime_ns) != (c.size, c.mtime_ns):
+            current = os.stat(c.path)
+            if (
+                (st.st_size, st.st_mtime_ns) != (c.size, c.mtime_ns)
+                or (current.st_dev, current.st_ino) != (st.st_dev, st.st_ino)
+                or open_by_any_process(c.path)
+            ):
                 return Result("changed")
             os.replace(tmp_name, c.path)
         finally:
@@ -333,7 +376,8 @@ def main() -> int:
 
     backups_root = args.state_dir / "backups"
     prune_backups(backups_root, args.keep_backup_days)
-    backup_dir = backups_root / time.strftime("%Y%m%dT%H%M%S")
+    backups_root.mkdir(exist_ok=True)
+    backup_dir = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%dT%H%M%S-"), dir=backups_root))
 
     db = open_state(args.state_dir)
     fingerprint = scan_fingerprint()
@@ -368,6 +412,8 @@ def main() -> int:
                 (str(c.path), *r.recorded_stat, fingerprint, r.status),
             )
     db.commit()
+    if not any(backup_dir.iterdir()):
+        backup_dir.rmdir()
 
     print("files:", dict(statuses))
     print("redactions by rule:" if args.apply else "would redact by rule:", dict(totals))

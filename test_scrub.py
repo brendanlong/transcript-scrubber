@@ -159,6 +159,40 @@ class ScrubTest(unittest.TestCase):
         self.assertEqual(path.stat().st_mtime_ns, before)
         self.assertIn("scanning 0 ", self.run_scrub("--apply").stdout)
 
+    def test_pem_markers_around_prose_are_not_redacted(self):
+        content = json.dumps({"m": (
+            "-----BEGIN PRIVATE KEY-----\n"
+            "This documentation explains how private keys are formatted and how to store them securely\n"
+            "-----END PRIVATE KEY-----")}) + "\n"
+        path = self.write_old("s.jsonl", content)
+        self.run_scrub("--apply")
+        self.assertEqual(path.read_text(), content)
+
+    def test_numbered_pem_lines_are_redacted(self):
+        body = "".join(f"{i + 10}\t" + "".join(secrets.choice(string.ascii_letters) for _ in range(64)) + "\n"
+                       for i in range(4))
+        content = json.dumps({"m": f"9\t-----BEGIN PRIVATE KEY-----\n{body}14\t-----END PRIVATE KEY-----"}) + "\n"
+        path = self.write_old("s.jsonl", content)
+        result = self.run_scrub("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(json.loads(path.read_text())["m"], "9\t[REDACTED:private-key]")
+
+    def test_gitleaks_allow_in_transcript_is_ignored(self):
+        token = fake_github_pat()
+        path = self.write_old("s.jsonl", json.dumps({"m": f"{token} # gitleaks:allow"}) + "\n")
+        self.run_scrub("--apply")
+        self.assertNotIn(token, path.read_text())
+
+    def test_file_held_open_is_not_replaced(self):
+        token = fake_github_pat()
+        path = self.write_old("s.jsonl", json.dumps({"m": token}) + "\n")
+        with open(path, "a"):
+            result = self.run_scrub("--apply")
+        self.assertIn(token, path.read_text())
+        self.assertIn("changed", result.stdout)
+        self.run_scrub("--apply")
+        self.assertNotIn(token, path.read_text())
+
     def test_implausible_secrets(self):
         self.assertIsNotNone(scrub.implausible_secret("ab:cd"))
         self.assertIsNotNone(scrub.implausible_secret('abcdefghijklmnop","+qrstuvwxyz'))
